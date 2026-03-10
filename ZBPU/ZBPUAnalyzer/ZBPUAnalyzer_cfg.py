@@ -10,6 +10,16 @@ parser.add_argument('--maxEvents', type=int, default=-1, help='Maximum number of
 parser.add_argument('--outputFile', type=str, default='output_histograms.root', help='Output ROOT file name')
 options = parser.parse_args()
 
+if options.inputFiles:
+    print(f"Input files: {options.inputFiles}")
+    filelist = []
+    # Split comma-separated input files
+    for item in options.inputFiles:
+        filelist.extend(item.split(','))
+    options.inputFiles = filelist
+else:
+    print("No input files provided. Please specify input files using --inputFiles.")
+    exit(1)
 
 process = cms.Process("ZBPUAnalyzer")
 
