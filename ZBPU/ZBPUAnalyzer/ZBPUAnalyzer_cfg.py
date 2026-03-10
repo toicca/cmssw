@@ -83,5 +83,3 @@ process.p = cms.Path(
     process.BadChargedCandidateFilter + 
     process.myAnalyzer
 )
-
-exit(0)
