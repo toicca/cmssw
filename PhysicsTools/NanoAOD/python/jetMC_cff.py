@@ -60,10 +60,7 @@ genJetFlavourAssociation = cms.EDProducer("JetFlavourClustering",
         # GHS algorithm omega parameter (default: 2.0)
         # Controls the angular distance metric
         omega = cms.double(2.0),
-        
-        # Minimum pT threshold for GHS jets (default: very small)
-        ptMin = cms.double(0.0),
-        
+
         # Flavour summation scheme
         # Options: "net_flav", "mod2_flav", "any_flav"
         #   - net_flav: Net flavour (algebraic sum)
@@ -121,7 +118,6 @@ genJetAK8FlavourAssociation = cms.EDProducer("JetFlavourClustering",
         enabled = cms.bool(True),
         alpha = cms.double(1.0),
         omega = cms.double(2.0),
-        ptMin = cms.double(5.0),
         flavSummationScheme = cms.string("net_flav")
     )
 )

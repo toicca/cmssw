@@ -105,7 +105,6 @@
 
 #include "PhysicsTools/JetMCAlgos/interface/GHSAlgo.h"
 #include "fastjet/contrib/FlavInfo.hh"
-#include "fastjet/contrib/GHSAlgo.hh"
 #include "fastjet/contrib/IFNPlugin.hh"
 
 #include "fastjet/NNH.hh"
@@ -116,6 +115,40 @@
 typedef std::shared_ptr<fastjet::ClusterSequence> ClusterSequencePtr;
 typedef std::shared_ptr<fastjet::JetDefinition> JetDefPtr;
 typedef std::shared_ptr<fastjet::JetDefinition::Plugin> PluginPtr;
+
+/// User info attached to the "ghost" particles inserted into the jet
+/// constituents. It keeps the reference to the originating GenParticle so that
+/// the clustered hadrons/partons/leptons can be recovered from the jet
+/// constituents, and it tags the kind of ghost via a small bit mask.
+class GhostInfo : public fastjet::PseudoJet::UserInfoBase {
+public:
+  GhostInfo(const bool& isHadron,
+            const bool& isbHadron,
+            const bool& isParton,
+            const bool& isLepton,
+            const reco::GenParticleRef& particleRef)
+      : m_particleRef(particleRef) {
+    m_type = 0;
+    if (isHadron)
+      m_type |= (1 << 0);
+    if (isbHadron)
+      m_type |= (1 << 1);
+    if (isParton)
+      m_type |= (1 << 2);
+    if (isLepton)
+      m_type |= (1 << 3);
+  }
+
+  bool isHadron() const { return (m_type & (1 << 0)); }
+  bool isbHadron() const { return (m_type & (1 << 1)); }
+  bool isParton() const { return (m_type & (1 << 2)); }
+  bool isLepton() const { return (m_type & (1 << 3)); }
+  const reco::GenParticleRef& particleRef() const { return m_particleRef; }
+
+protected:
+  const reco::GenParticleRef m_particleRef;
+  int m_type;
+};
 
 //
 // class declaration
@@ -130,11 +163,31 @@ public:
 private:
   void produce(edm::Event&, const edm::EventSetup&) override;
 
-  template <typename OutputIt>
+  /// Insert "ghost" particles carrying a GhostInfo into the jet constituents.
+  /// Used for the collection that is reclustered to recover the jet flavour.
   void insertGhosts(const edm::Handle<reco::GenParticleRefVector>& particles,
                     const double ghostRescaling,
-                    const bool withPdgId,
-                    OutputIt out);
+                    const bool isHadron,
+                    const bool isbHadron,
+                    const bool isParton,
+                    const bool isLepton,
+                    std::vector<fastjet::PseudoJet>& constituents);
+  /// Insert "ghost" particles carrying a fastjet::contrib::FlavHistory.
+  /// Used for the standalone IFN input collection.
+  template <typename OutputIt>
+  void insertFlavouredGhosts(const edm::Handle<reco::GenParticleRefVector>& particles,
+                             const double ghostRescaling,
+                             const bool withPdgId,
+                             OutputIt out);
+  /// True if the particle is a parton with no parton daughters, i.e. the last
+  /// parton before hadronisation.
+  bool isFinalParton(const reco::GenParticleRef& particle) const;
+  /// Inline GHS flavour algorithm (arXiv:2205.01109), operating on jets whose
+  /// user_index is the original jet index and flavour particles whose
+  /// user_index encodes the jet association (0 = unassociated, -(i+1) = jet i).
+  void GHSCore(const std::vector<fastjet::PseudoJet>& inputJets,
+               const std::vector<fastjet::PseudoJet>& inputFlavParticles,
+               std::vector<fastjet::PseudoJet>& outputGHSAlgoJets);
   void matchReclusteredJets(const edm::Handle<edm::View<reco::Jet>>& jets,
                             const std::vector<fastjet::PseudoJet>& matchedJets,
                             std::vector<int>& matchedIndices,
@@ -186,7 +239,6 @@ private:
     bool enabled;
     double alpha;
     double omega;
-    double ptMin;
     std::string flavSummationScheme;
     std::shared_ptr<fastjet::contrib::FlavRecombiner> flavRecombiner;
   };
@@ -276,7 +328,6 @@ JetFlavourClustering::JetFlavourClustering(const edm::ParameterSet& iConfig)
     if (ghsParams_.enabled) {
       ghsParams_.alpha = ghsPSet.getParameter<double>("alpha");
       ghsParams_.omega = ghsPSet.getParameter<double>("omega");
-      ghsParams_.ptMin = ghsPSet.getParameter<double>("ptMin");
       ghsParams_.flavSummationScheme = ghsPSet.getParameter<std::string>("flavSummationScheme");
       
       // Set up the flavour recombiner based on summation scheme
@@ -442,32 +493,21 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
   }
 
   // create the "ghosts"
-  size_t bHadronStart = fjInputs.size();
-  insertGhosts(bHadrons, ghostRescaling_, false, std::back_inserter(fjInputs));
-  size_t cHadronStart = fjInputs.size();
-  insertGhosts(cHadrons, ghostRescaling_, false, std::back_inserter(fjInputs));
-  size_t partonStart = fjInputs.size();
-  insertGhosts(partons, ghostRescaling_, true, std::back_inserter(fjInputs));
+  insertGhosts(bHadrons, ghostRescaling_, true, true, false, false, fjInputs);
+  insertGhosts(cHadrons, ghostRescaling_, true, false, false, false, fjInputs);
+  insertGhosts(partons, ghostRescaling_, false, false, true, false, fjInputs);
   std::vector<fastjet::PseudoJet> ghostFinalPartons;
-  insertGhosts(finalPartons, ghostRescaling_, true, std::back_inserter(ghostFinalPartons)); // Final partons are not rescaled since they are only used for the optional IFN algorithm
-  size_t leptonStart = fjInputs.size();
+  insertFlavouredGhosts(finalPartons, ghostRescaling_, true, std::back_inserter(ghostFinalPartons)); // only used for the optional IFN algorithm
   if (useLeptons_) {
-    insertGhosts(leptons, ghostRescaling_, false, std::back_inserter(fjInputs));
+    insertGhosts(leptons, ghostRescaling_, false, false, false, true, fjInputs);
   }
 
-  // initialize the indices matching reclustered jets to original jets
+  // initialize the indices associating the ghosts to the original jets, used by
+  // the GHS algorithm (0 = unassociated, -(i+1) = associated to original jet i)
   std::vector<int> fjInputsMatchingIndices(fjInputs.size(), 0);
   // index the fastjet inputs to themselves as the order in fjInputs
   for(auto it = fjInputs.begin(); it != fjInputs.end(); ++it) {
     it->set_user_index(std::distance(fjInputs.begin(), it));
-    if (!it->has_user_info()) {
-      it->set_user_info(new fastjet::contrib::FlavHistory(0));
-    }
-  }
-
-  if (ghsParams_.enabled) {
-    // Set the recombiner for the fjJetDefinition to the GHS flavoured recombiner
-    fjJetDefinition_->set_recombiner(ghsParams_.flavRecombiner.get());
   }
 
   std::vector<int> ifnIndices;
@@ -494,13 +534,6 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
   std::vector<int> reclusteredIndices;
   matchReclusteredJets(jets, inclusiveJets, reclusteredIndices, false);
 
-  std::vector<int> ghsIndices;
-  std::vector<fastjet::PseudoJet> ghsJets;
-  if (ghsParams_.enabled) {
-    ghsJets = fastjet::contrib::run_GHS(inclusiveJets, ghsParams_.ptMin, ghsParams_.alpha, ghsParams_.omega, *ghsParams_.flavRecombiner);
-    matchReclusteredJets(jets, ghsJets, ghsIndices, true);
-  }
-
   // match groomed and original jets
   std::vector<int> groomedIndices;
   if (useSubjets_) {
@@ -518,8 +551,12 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
     matchSubjets(groomedIndices, groomedJets, subjets, subjetIndices);
   }
 
-  // Find to which jet each ghost pseudojet belongs to
-  std::vector<int> inputToJetIdx = fjClusterSeq_->particle_jet_indices(inclusiveJets);
+  // GHS jet slot -> original jet index. Only jets with a genuine reclustered
+  // match take part in the GHS algorithm, mirroring the previous behaviour
+  // where GHS ran on the reclustered inclusive jets. The slot index is what
+  // GHSBriefJet::associated_jet() decodes from the flavour particle
+  // user_index, so it must index this vector, not the original collection.
+  std::vector<size_t> ghsJetOrigIdx;
 
   for (size_t i = 0; i < jets->size(); ++i) {
     reco::GenParticleRefVector clusteredbHadrons;
@@ -583,19 +620,36 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
       }
 
 
-      // go through the indices of the reclustered jets and find the "ghost" particles clustered inside the matched reclustered jet
-      for (size_t j = 0; j < inputToJetIdx.size(); ++j) {
-        if (inputToJetIdx.at(j) == reclusteredIndices.at(i)) {
-          if (j >= bHadronStart && j < cHadronStart) {
-            clusteredbHadrons.push_back(bHadrons->at(j - bHadronStart));
-          } else if (j >= cHadronStart && j < partonStart) {
-            clusteredcHadrons.push_back(cHadrons->at(j - cHadronStart));
-          } else if (j >= partonStart && j < leptonStart) {
-            clusteredPartons.push_back(partons->at(j - partonStart));
-          } else if (useLeptons_ && j >= leptonStart) {
-            clusteredLeptons.push_back(leptons->at(j - leptonStart));
-          }
-        }      
+      // reserve this jet's slot in the GHS input vector
+      const int ghsJetSlot = static_cast<int>(ghsJetOrigIdx.size());
+      ghsJetOrigIdx.push_back(i);
+
+      // get jet constituents (sorted by Pt)
+      std::vector<fastjet::PseudoJet> constituents =
+          fastjet::sorted_by_pt(inclusiveJets.at(reclusteredIndices.at(i)).constituents());
+
+      // loop over jet constituents and try to find "ghosts"
+      for (std::vector<fastjet::PseudoJet>::const_iterator it = constituents.begin(); it != constituents.end(); ++it) {
+        if (!it->has_user_info())
+          continue;  // skip if not a "ghost"
+
+        // ghost clustering association, consumed by the GHS algorithm below
+        fjInputsMatchingIndices[it->user_index()] = -(ghsJetSlot + 1);
+        // "ghost" hadron
+        if (it->user_info<GhostInfo>().isHadron()) {
+          // "ghost" b hadron
+          if (it->user_info<GhostInfo>().isbHadron())
+            clusteredbHadrons.push_back(it->user_info<GhostInfo>().particleRef());
+          // "ghost" c hadron
+          else
+            clusteredcHadrons.push_back(it->user_info<GhostInfo>().particleRef());
+        }
+        // "ghost" parton
+        else if (it->user_info<GhostInfo>().isParton())
+          clusteredPartons.push_back(it->user_info<GhostInfo>().particleRef());
+        // "ghost" lepton
+        else if (it->user_info<GhostInfo>().isLepton())
+          clusteredLeptons.push_back(it->user_info<GhostInfo>().particleRef());
       }
 
       int hadronFlavour = 0;  // default hadron flavour set to 0 (= undefined)
@@ -615,14 +669,6 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
           (*jetFlavourInfos)[jets->refAt(i)].setAlgoFlav(reco::FlavAlgo::kIFN, fastjet::contrib::FlavHistory::current_flavour_of(ifnJets.at(ifnIndices.at(i))));
         }
       }
-      if (ghsParams_.enabled) {
-        if (ghsIndices.at(i) < 0) {
-          (*jetFlavourInfos)[jets->refAt(i)].setAlgoFlav(reco::FlavAlgo::kGHS, fastjet::contrib::FlavInfo(0));
-        } else {
-          (*jetFlavourInfos)[jets->refAt(i)].setAlgoFlav(reco::FlavAlgo::kGHS, fastjet::contrib::FlavHistory::current_flavour_of(ghsJets.at(ghsIndices.at(i))));
-        }
-      }
-
     }
     // if subjets are used, determine their flavour
     if (useSubjets_) {
@@ -671,6 +717,61 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
     }
   }
 
+  /**************************************************************************
+   * [Section]
+   *    Produce GHS-algorithm-based flavour information for jets.
+   * [Implementation]
+   *    1.  Prepare the inputs for GHS directly from the association result.
+   *    2.  Feed to GHSCore.
+   *    3.  Match to original jets directly using the user_index.
+   * [Note]
+   *    1.  We are effectively creating a copy of the original flavour inputs,
+   *        and therefore we are not altering the order of the original input.
+   *    2.  The order of fjGHSAlgoJets defines the association index:
+   *        GHSBriefJet::associated_jet() decodes a flavour particle
+   *        user_index -(slot+1) as an index into GHSInfo::jets. The jets
+   *        themselves keep the original jet index in their user_index so the
+   *        results can be written back.
+   **************************************************************************/
+  if (ghsParams_.enabled) {
+    std::vector<fastjet::PseudoJet> fjGHSAlgoJets;
+    std::vector<fastjet::PseudoJet> fjGHSAlgoFlavPartons;
+    std::vector<fastjet::PseudoJet> fjGHSAlgoJetResults;
+    fjGHSAlgoJets.reserve(ghsJetOrigIdx.size());
+    for (size_t slot = 0; slot < ghsJetOrigIdx.size(); ++slot) {
+      const size_t i = ghsJetOrigIdx[slot];
+      fjGHSAlgoJets.push_back(inclusiveJets.at(reclusteredIndices.at(i)));
+      fjGHSAlgoJets.back().set_user_info(new fastjet::contrib::FlavHistory(0));
+      fjGHSAlgoJets.back().set_user_index(i);
+    }
+    for (size_t idx = 0; idx < fjInputs.size(); ++idx) {
+      if (!fjInputs[idx].has_user_info()) {
+        continue;  // not a ghost
+      }
+      if (fjInputs[idx].user_info<GhostInfo>().isParton() &&
+          isFinalParton(fjInputs[idx].user_info<GhostInfo>().particleRef())) {
+        fastjet::PseudoJet partonPseudoJet = fjInputs[idx];
+        partonPseudoJet /= ghostRescaling_;  // restore the original momentum
+        partonPseudoJet.set_user_info(
+            new fastjet::contrib::FlavHistory(fjInputs[idx].user_info<GhostInfo>().particleRef()->pdgId()));
+        // set user index with the jet association index already found
+        partonPseudoJet.set_user_index(fjInputsMatchingIndices[idx]);
+        fjGHSAlgoFlavPartons.push_back(partonPseudoJet);
+      }
+    }
+    // GHS Core is ready to use
+    GHSCore(fjGHSAlgoJets, fjGHSAlgoFlavPartons, fjGHSAlgoJetResults);
+    // Adding the flavour assignment results.
+    for (size_t idx = 0; idx < fjGHSAlgoJetResults.size(); ++idx) {
+      int origJetIdx = fjGHSAlgoJetResults[idx].user_index();
+      if (origJetIdx < 0 || origJetIdx >= static_cast<int>(jets->size())) {
+        continue;  // not matched to any original jet
+      }
+      (*jetFlavourInfos)[jets->refAt(origJetIdx)].setAlgoFlav(
+          reco::FlavAlgo::kGHS, fastjet::contrib::FlavHistory::current_flavour_of(fjGHSAlgoJetResults[idx]));
+    }
+  }
+
   //deallocate only at the end of the event processing
   fjClusterSeq_.reset();
 
@@ -683,9 +784,30 @@ void JetFlavourClustering::produce(edm::Event& iEvent, const edm::EventSetup& iS
     iEvent.put(std::move(subjetFlavourInfos), "SubJets");
 }
 
-// ------------ method that creates "ghost" particles from GenParticles ------------
+// ------------ method that inserts "ghost" particles in the vector of jet constituents ------------
+void JetFlavourClustering::insertGhosts(const edm::Handle<reco::GenParticleRefVector>& particles,
+                                        const double ghostRescaling,
+                                        const bool isHadron,
+                                        const bool isbHadron,
+                                        const bool isParton,
+                                        const bool isLepton,
+                                        std::vector<fastjet::PseudoJet>& constituents) {
+  // insert "ghost" particles in the vector of jet constituents
+  for (reco::GenParticleRefVector::const_iterator it = particles->begin(); it != particles->end(); ++it) {
+    if ((*it)->pt() == 0) {
+      edm::LogInfo("NullTransverseMomentum") << "dropping input ghost candidate with pt=0";
+      continue;
+    }
+    fastjet::PseudoJet p((*it)->px(), (*it)->py(), (*it)->pz(), (*it)->energy());
+    p *= ghostRescaling;  // rescale particle momentum
+    p.set_user_info(new GhostInfo(isHadron, isbHadron, isParton, isLepton, *it));
+    constituents.push_back(p);
+  }
+}
+
+// ------------ method that creates flavoured "ghost" particles from GenParticles ------------
 template<typename OutputIt>
-void JetFlavourClustering::insertGhosts(const edm::Handle<reco::GenParticleRefVector>& particles, const double ghostRescaling, const bool withPdgId, OutputIt out) {
+void JetFlavourClustering::insertFlavouredGhosts(const edm::Handle<reco::GenParticleRefVector>& particles, const double ghostRescaling, const bool withPdgId, OutputIt out) {
 
   for (const auto& it : *particles) {
     if (it->pt() == 0) {
@@ -702,6 +824,22 @@ void JetFlavourClustering::insertGhosts(const edm::Handle<reco::GenParticleRefVe
     }
     *out++ = ghost;
   }
+}
+
+// ------------ method check if the clustered parton is immediately before hadronization ------------
+bool JetFlavourClustering::isFinalParton(const reco::GenParticleRef& particle) const {
+  // Require parton in the first place.
+  if (!particle.isNonnull() || !particle.isAvailable() || !CandMCTagUtils::isParton(*particle)) {
+    return false;
+  }
+  // Loop over daughters. Exclude particles that have parton daughters.
+  for (size_t i = 0; i < particle->numberOfDaughters(); ++i) {
+    const reco::Candidate* daughter = particle->daughter(i);
+    if (daughter != nullptr && CandMCTagUtils::isParton(*daughter)) {
+      return false;
+    }
+  }
+  return true;  // No parton daughters found.
 }
 
 // ------------ method that matches reclustered and original jets based on minimum dR ------------
@@ -935,6 +1073,116 @@ void JetFlavourClustering::assignToSubjets(const std::vector<fastjet::PseudoJet>
         std::distance(dR2toSubjets.begin(), std::min_element(dR2toSubjets.begin(), dR2toSubjets.end()));
 
     assignedParticles.at(closestSubjetIdx).push_back(*it);
+  }
+}
+
+/******************************************************************************
+ *    GHSCore
+ *  [Description]
+ *    Produce GHS algorithm flavour for a given set of jets and flavour inputs.
+ *  [Arguments]
+ *    const std::vector<fastjet::PseudoJet>& inputJets
+ *    : Vector of jets to be flavoured. Require user_index pointing to matched
+ *      jet in the original collection.
+ *    const std::vector<fastjet::PseudoJet>& inputFlavParticles
+ *    : Vector of flavour particles to be used for flavouring the jets. Can be
+ *      either b/c hadrons or partons. Require user_index -(i + 1) for
+ *      association with jet number i and 0 if not associated.
+ *    std::vector<fastjet::PseudoJet>& outputGHSAlgoJets
+ *    : Vector of GHS algorithm flavoured jets to be produced.
+ *  [Return]
+ *    (void)
+ *  [Note]
+ *    1.  The index pointed by user_index of inputJets is temporarily kept by
+ *        inputJets during the algorithm and restored at the end.
+ ******************************************************************************/
+void JetFlavourClustering::GHSCore(const std::vector<fastjet::PseudoJet>& inputJets,
+                                   const std::vector<fastjet::PseudoJet>& inputFlavParticles,
+                                   std::vector<fastjet::PseudoJet>& outputGHSAlgoJets) {
+  // verify if output vectors are empty
+  if (!outputGHSAlgoJets.empty()) {
+    edm::LogError("GHSAlgoOutputVectorsNotEmpty")
+        << "The output vectors for GHS algorithm are not empty. Please check the configuration.";
+  }
+  if (inputJets.empty()) {
+    // No jets to be assigned flavour
+    return;
+  }
+  std::vector<fastjet::PseudoJet> inputJetAndFlavParticles = inputJets;
+  inputJetAndFlavParticles.insert(
+      inputJetAndFlavParticles.end(), inputFlavParticles.begin(), inputFlavParticles.end());
+  outputGHSAlgoJets = inputJets;
+  std::vector<fastjet::contrib::FlavInfo> finalJetsFlavInfo(outputGHSAlgoJets.size());
+  int njets = outputGHSAlgoJets.size();
+
+  /// Prepare the indices of the input jets in the inputJetAndFlavParticles
+  for (size_t idx = 0; idx < inputJets.size(); ++idx) {
+    inputJetAndFlavParticles[idx].set_user_index(1);  // unified index "1"
+  }
+
+  /// Set up GHS Info
+  GHSInfo ghsInfo;
+  ghsInfo.jets = outputGHSAlgoJets;
+  ghsInfo.njets = njets;
+  ghsInfo.alpha = ghsParams_.alpha;
+  ghsInfo.omega = ghsParams_.omega;
+  ghsInfo.flav_recombiner = *ghsParams_.flavRecombiner;
+
+  // Set up NNH for GHS algorithm
+  fastjet::NNH<GHSBriefJet, GHSInfo> nnh(inputJetAndFlavParticles, &ghsInfo);
+  int iA, iB;
+  while (njets > 0) {  // the loop does not change njets, but njets > 0 is necessary
+                       // given that the selector could cut off all jets
+    double dij = nnh.dij_min(iA, iB);
+    if (dij == std::numeric_limits<double>::max()) {
+      break;
+    }
+    if (iB >= 0) {
+      if (iA > iB)
+        std::swap(iA, iB);
+      // we must never have two jets
+      assert(iB >= njets && "second entry must be a particle");
+      if (iA < njets) {
+        // if the first is a jet, assign B's flavour to A and then remove B
+        // (note that through the shared pointer, this also affects the
+        // flavour of the objects in the NNH object -- which is dangerous --
+        // one should really remove the jet and add it back in)
+        fastjet::contrib::FlavInfo flavB =
+            inputJetAndFlavParticles[iB].user_info<fastjet::contrib::FlavHistory>().current_flavour();
+        finalJetsFlavInfo[iA] = finalJetsFlavInfo[iA] + flavB;
+        ghsParams_.flavRecombiner->apply_summation_choice(finalJetsFlavInfo[iA]);
+        nnh.remove_jet(iB);
+      } else {
+        //> iA & iB are both flavour inputs
+        // merge
+        fastjet::PseudoJet mergedFlavoured = inputJetAndFlavParticles[iA];
+        mergedFlavoured.reset_momentum(inputJetAndFlavParticles[iA] +
+                                       inputJetAndFlavParticles[iB]);  //<- resetting only the momentum keeps the
+        //> determine the jet association for the merged cluster:
+        //> can only be associated with a jet if *both* inputs were
+        // associated with the *same* jet
+        if (inputJetAndFlavParticles[iA].user_index() == inputJetAndFlavParticles[iB].user_index()) {
+          mergedFlavoured.set_user_index(inputJetAndFlavParticles[iA].user_index());
+        } else {
+          mergedFlavoured.set_user_index(0);
+        }
+        fastjet::contrib::FlavInfo flav =
+            fastjet::contrib::FlavHistory::current_flavour_of(inputJetAndFlavParticles[iA]) +
+            fastjet::contrib::FlavHistory::current_flavour_of(inputJetAndFlavParticles[iB]);
+        ghsParams_.flavRecombiner->apply_summation_choice(flav);
+        /// set FlavInfo attribute
+        mergedFlavoured.set_user_info(new fastjet::contrib::FlavHistory(flav));
+        inputJetAndFlavParticles.push_back(mergedFlavoured);
+        nnh.merge_jets(iA, iB, mergedFlavoured, inputJetAndFlavParticles.size() - 1);
+      }
+    } else {
+      nnh.remove_jet(iA);
+    }
+  }
+  for (unsigned i = 0; i < outputGHSAlgoJets.size(); i++) {
+    finalJetsFlavInfo[i].update_flavourless_attribute();
+    outputGHSAlgoJets[i].set_user_info(
+        new fastjet::contrib::FlavHistory(fastjet::contrib::FlavInfo(finalJetsFlavInfo[i])));
   }
 }
 
